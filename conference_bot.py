@@ -13,6 +13,7 @@ Credentials are read from environment variables (set as GitHub Secrets):
 """
 
 import os
+import re
 import smtplib
 import logging
 from datetime import datetime, timedelta, date
@@ -29,11 +30,27 @@ log = logging.getLogger(__name__)
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 KEYWORDS = [
+    # Core topics
     "reinforcement learning", "robot learning", "robotics",
     "autonomous systems", "multi-agent", "policy optimization",
     "deep reinforcement learning", "imitation learning",
     "sim-to-real", "embodied ai", "motion planning",
-    "control", "manipulation", "locomotion", "navigation",
+    "manipulation", "locomotion", "legged", "humanoid",
+    "dexterous", "sim2real",
+    # Broader RL / decision-making
+    "reward", "offline rl", "online rl", "rlhf",
+    "decision making", "world model", "model-based",
+    "safe ai", "ai safety", "alignment",
+    "foundation model for robot", "robot foundation",
+    "language model for robot", "llm for robot",
+    "generalist agent", "generalist robot",
+    # Application domains the user asked for
+    "robot manipulation", "legged robot", "aerial robot",
+    "autonomous driving", "autonomous vehicle",
+    "navigation", "planning under uncertainty",
+    # Also catch common workshop naming patterns
+    "world models", "offline dataset", "online adaptation",
+    "game-theoretic", "lifelong agent", "agentic system",
 ]
 
 FLAGSHIP_VENUES = {
@@ -47,6 +64,15 @@ LOOKBACK_DAYS  = 3
 
 
 # ── Data sources ──────────────────────────────────────────────────────────────
+
+# Conference prefixes to scan on OpenReview (year updated annually as new ones appear)
+OPENREVIEW_PREFIXES = [
+    "NeurIPS.cc/2026/Workshop/",
+    "ICML.cc/2026/Workshop/",
+    "ICLR.cc/2026/Workshop/",
+    "ICLR.cc/2027/Workshop/",
+    "NeurIPS.cc/2027/Workshop/",
+]
 
 def fetch_aideadlines() -> List[Dict]:
     """Pull the ai-deadlines YAML from GitHub — most reliable structured source."""
@@ -71,6 +97,135 @@ def fetch_aideadlines() -> List[Dict]:
     except Exception as exc:
         log.warning("aideadlines fetch failed: %s", exc)
         return []
+
+
+def _or_parse_deadline_str(date_field: str) -> str:
+    """Extract the date part from strings like 'Submission Deadline: Aug 30 2026 12:29PM UTC-0'."""
+    # Strip leading label
+    for prefix in ("submission deadline:", "deadline:", "due:", "paper deadline:"):
+        idx = date_field.lower().find(prefix)
+        if idx != -1:
+            date_field = date_field[idx + len(prefix):].strip()
+            break
+    # Keep only the date portion (drop time/timezone)
+    parts = date_field.split()
+    # Expect: Month Day Year [Time] [TZ]
+    if len(parts) >= 3:
+        return " ".join(parts[:3])
+    return date_field.strip()
+
+
+def fetch_openreview() -> List[Dict]:
+    """Query the OpenReview API for workshop submission deadlines.
+
+    Three-pass strategy (minimises HTTP calls):
+      1. For each conference prefix, list Workshop sub-group IDs.
+      2. Batch-fetch group details for title / location / website.
+      3. Batch-fetch /-/Submission invitations to get precise duedate timestamps.
+    """
+    import time
+
+    results: List[Dict] = []
+    ua   = {"User-Agent": "conference-bot/1.0", "Accept": "application/json"}
+    base = "https://api2.openreview.net"
+    BATCH = 25
+
+    def _batched_get(endpoint: str, ids: List[str]) -> List[Dict]:
+        out = []
+        for i in range(0, len(ids), BATCH):
+            time.sleep(0.4)
+            r = requests.get(
+                f"{base}/{endpoint}",
+                params={"ids": ",".join(ids[i: i + BATCH])},
+                headers=ua,
+                timeout=25,
+            )
+            if r.ok:
+                key = "groups" if endpoint == "groups" else "invitations"
+                out.extend(r.json().get(key, []))
+            else:
+                log.warning("OpenReview %s batch failed: %s", endpoint, r.status_code)
+        return out
+
+    def _ms_to_date(ms) -> str:
+        """Convert millisecond epoch timestamp to 'YYYY-MM-DD' string."""
+        try:
+            return datetime.utcfromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    all_group_ids: List[str] = []
+
+    # Pass 1 — collect group IDs
+    for prefix in OPENREVIEW_PREFIXES:
+        try:
+            depth = prefix.count("/")
+            r = requests.get(
+                f"{base}/groups",
+                params={"prefix": prefix, "limit": 150, "select": "id"},
+                headers=ua,
+                timeout=20,
+            )
+            if not r.ok:
+                log.warning("OpenReview prefix listing failed for %s: %s", prefix, r.status_code)
+                continue
+            ids = [g["id"] for g in r.json().get("groups", [])
+                   if g["id"].count("/") == depth]  # direct children only
+            log.info("  OpenReview %s → %d workshops", prefix.rstrip("/"), len(ids))
+            all_group_ids.extend(ids)
+            time.sleep(0.5)
+        except Exception as exc:
+            log.warning("OpenReview prefix listing error for %s: %s", prefix, exc)
+
+    if not all_group_ids:
+        return results
+
+    # Pass 2 — fetch group details (title, location, website, fallback deadline string)
+    groups_by_id: Dict[str, Dict] = {}
+    for grp in _batched_get("groups", all_group_ids):
+        groups_by_id[grp["id"]] = grp
+
+    # Pass 3 — fetch submission invitations for duedate
+    inv_ids = [f"{gid}/-/Submission" for gid in all_group_ids]
+    duedates: Dict[str, str] = {}
+    for inv in _batched_get("invitations", inv_ids):
+        gid = inv["id"].replace("/-/Submission", "")
+        ms  = inv.get("duedate")
+        if ms:
+            duedates[gid] = _ms_to_date(ms)
+
+    # Merge
+    for gid in all_group_ids:
+        grp     = groups_by_id.get(gid, {"id": gid, "content": {}})
+        content = grp.get("content", {})
+
+        def val(key: str) -> str:
+            v = content.get(key, {})
+            return (v.get("value", "") if isinstance(v, dict) else str(v)) or ""
+
+        title    = val("title") or gid.split("/")[-1]
+        subtitle = val("subtitle")
+        location = val("location")
+        website  = val("website")
+        start    = val("start_date")
+        if start and str(start).isdigit():
+            start = _ms_to_date(start)
+
+        # Prefer invitation duedate; fall back to parsing content.date string
+        deadline = duedates.get(gid) or _or_parse_deadline_str(val("date"))
+
+        results.append({
+            "title":     subtitle or title,
+            "full_name": title,
+            "deadline":  deadline,
+            "date":      start,
+            "location":  location,
+            "url":       website or f"https://openreview.net/group?id={gid}",
+            "source":    "OpenReview",
+            "tags":      title + " " + subtitle,
+        })
+
+    return results
 
 
 def fetch_wikicfp() -> List[Dict]:
@@ -162,6 +317,17 @@ def is_relevant(conf: Dict) -> bool:
         conf.get("title", ""), conf.get("full_name", ""),
         conf.get("tags", ""), conf.get("sub", ""),
     ]).lower()
+
+    # Standalone "rl" as a whole word (catches "RL from World Feedback", etc.)
+    if re.search(r'\brl\b', text):
+        return True
+
+    # OpenReview entries are already scoped to major ML conferences — require
+    # keyword match so we don't include every NeurIPS/ICML workshop.
+    if conf.get("source") == "OpenReview":
+        return any(kw in text for kw in KEYWORDS)
+
+    # For WikiCFP / aideadlines: flagship venue alone is enough (main tracks)
     if any(v in text for v in FLAGSHIP_VENUES):
         return True
     return any(kw in text for kw in KEYWORDS)
@@ -172,7 +338,8 @@ def in_window(dl: date) -> bool:
     return (today - timedelta(days=LOOKBACK_DAYS)) <= dl <= (today + timedelta(days=LOOKAHEAD_DAYS))
 
 
-def build_deadline_list(ai_entries: List[Dict], wiki_entries: List[Dict]) -> List[Dict]:
+def build_deadline_list(ai_entries: List[Dict], wiki_entries: List[Dict],
+                        or_entries: List[Dict] = None) -> List[Dict]:
     seen: set = set()
     output: List[Dict] = []
 
@@ -205,6 +372,9 @@ def build_deadline_list(ai_entries: List[Dict], wiki_entries: List[Dict]) -> Lis
     for e in wiki_entries:
         add(e)
 
+    for e in (or_entries or []):
+        add(e)
+
     output.sort(key=lambda x: x["parsed_deadline"])
     return output
 
@@ -233,10 +403,14 @@ def build_html(deadlines: List[Dict]) -> str:
         full  = d.get("full_name", "") or name
         url   = d.get("url", "#")
         sub   = f"<div style='font-size:12px;color:#718096'>{full}</div>" if full.lower() != name.lower() else ""
+        src   = d.get("source", "")
+        src_colors = {"OpenReview": "#6b46c1", "WikiCFP": "#2b6cb0", "aideadlines": "#276749"}
+        src_badge = (f"<span style='font-size:10px;background:{src_colors.get(src,'#718096')};"
+                     f"color:white;padding:1px 5px;border-radius:3px;margin-left:4px'>{src}</span>")
         rows += f"""
         <tr style='border-bottom:1px solid #e2e8f0'>
           <td style='padding:12px 8px;vertical-align:top'>
-            <a href='{url}' style='font-weight:600;color:#2b6cb0;text-decoration:none'>{name}</a>{sub}
+            <a href='{url}' style='font-weight:600;color:#2b6cb0;text-decoration:none'>{name}</a>{src_badge}{sub}
           </td>
           <td style='padding:12px 8px;white-space:nowrap'>{dl.strftime('%b %d, %Y')}<br>{urgency_badge(dl)}</td>
           <td style='padding:12px 8px;color:#4a5568'>{d.get('date','TBD')}</td>
@@ -267,6 +441,7 @@ def build_html(deadlines: List[Dict]) -> str:
   <p style='margin-top:24px;font-size:12px;color:#a0aec0'>
     Sources: <a href='https://aideadlin.es' style='color:#a0aec0'>aideadlin.es</a> &middot;
     <a href='http://www.wikicfp.com' style='color:#a0aec0'>WikiCFP</a> &middot;
+    <a href='https://openreview.net' style='color:#a0aec0'>OpenReview</a> &middot;
     Showing deadlines within {LOOKAHEAD_DAYS} days.
   </p>
 </body></html>"""
@@ -280,7 +455,7 @@ def build_plain(deadlines: List[Dict]) -> str:
         delta = (dl - date.today()).days
         urgency = f"({abs(delta)}d ago)" if delta < 0 else f"(in {delta}d)"
         lines += [
-            f"  {d['title']}",
+            f"  {d['title']}  [{d.get('source','')}]",
             f"    Deadline : {dl.strftime('%b %d, %Y')} {urgency}",
             f"    Event    : {d.get('date','TBD')}  {d.get('location','')}",
             f"    Link     : {d.get('url','')}",
@@ -333,7 +508,11 @@ def main() -> None:
     wiki_entries = fetch_wikicfp()
     log.info("  %d entries", len(wiki_entries))
 
-    deadlines = build_deadline_list(ai_entries, wiki_entries)
+    log.info("Fetching from OpenReview...")
+    or_entries = fetch_openreview()
+    log.info("  %d entries", len(or_entries))
+
+    deadlines = build_deadline_list(ai_entries, wiki_entries, or_entries)
     log.info("Filtered to %d relevant deadlines in window", len(deadlines))
 
     html  = build_html(deadlines)
