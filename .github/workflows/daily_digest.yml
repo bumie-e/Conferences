@@ -1,0 +1,30 @@
+name: Daily Conference Digest
+
+on:
+  schedule:
+    # Runs every day at 08:00 UTC — adjust to taste
+    - cron: "0 8 * * *"
+  workflow_dispatch:  # allows manual trigger from the Actions tab
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run conference bot
+        env:
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+        run: python conference_bot.py
