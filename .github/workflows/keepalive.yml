@@ -1,0 +1,26 @@
+name: Keep Actions Alive
+
+# GitHub disables scheduled workflows on inactive repos.
+# This workflow runs 5 minutes before the digest and writes a timestamp
+# to keep the repo "active" so the cron scheduler stays enabled.
+on:
+  schedule:
+    - cron: "55 7 * * *"   # 07:55 UTC — 5 min before the digest
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update last-run timestamp
+        run: |
+          echo "Last keepalive: $(date -u '+%Y-%m-%d %H:%M UTC')" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --cached --quiet || git commit -m "chore: keepalive $(date -u '+%Y-%m-%d')"
+          git push
